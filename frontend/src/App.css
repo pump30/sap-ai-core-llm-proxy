@@ -120,6 +120,23 @@ body {
   border-color: var(--accent);
 }
 
+/* Logs Button (Desktop App) */
+.logs-btn {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background-color: var(--input-bg);
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.logs-btn:hover {
+  background-color: var(--bg-tertiary);
+  border-color: #4ade80;
+}
+
 /* Settings Button */
 .settings-btn {
   padding: 8px 16px;

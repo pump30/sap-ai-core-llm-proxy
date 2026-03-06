@@ -8,13 +8,39 @@ import { ImageGenerator } from './components/ImageGenerator';
 import { useChat } from './hooks/useChat';
 import { api } from './services/api';
 
+// Check if running in desktop app (PyWebView)
+const isDesktopApp = typeof window.pywebview !== 'undefined';
+
 function App() {
   const [activeTab, setActiveTab] = useState('chat');
   const [selectedModel, setSelectedModel] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState(loadSettings);
+  const [serverStatus, setServerStatus] = useState(null);
 
   const { messages, isLoading, error, sendMessage, clearMessages, setError } = useChat();
+
+  // Get server status if in desktop app
+  useEffect(() => {
+    if (isDesktopApp && window.pywebview.api) {
+      window.pywebview.api.get_server_status().then(status => {
+        setServerStatus(status);
+      }).catch(err => {
+        console.error('Failed to get server status:', err);
+      });
+    }
+  }, []);
+
+  // Open log window (only available in desktop app)
+  const openLogWindow = async () => {
+    if (isDesktopApp && window.pywebview.api) {
+      try {
+        await window.pywebview.api.open_log_window();
+      } catch (err) {
+        console.error('Failed to open log window:', err);
+      }
+    }
+  };
 
   // Initialize API key from settings
   useEffect(() => {
@@ -75,6 +101,11 @@ function App() {
                 Clear Chat
               </button>
             </>
+          )}
+          {isDesktopApp && (
+            <button className="logs-btn" onClick={openLogWindow} title="Open Server Logs">
+              📋 Logs
+            </button>
           )}
           <button className="settings-btn" onClick={() => setSettingsOpen(true)}>
             Settings

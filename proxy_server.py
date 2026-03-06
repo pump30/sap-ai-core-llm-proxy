@@ -1,4 +1,5 @@
 import logging
+import sys
 from flask import Flask, request, jsonify, Response, stream_with_context, send_from_directory
 import requests
 from requests.adapters import HTTPAdapter
@@ -301,7 +302,15 @@ _http_session = create_http_session()
 
 # Setup static folder for frontend (manually served, not via Flask's static_url_path)
 # This prevents conflicts between static files and API routes
-static_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
+# Handle both normal script execution and PyInstaller frozen executable
+if getattr(sys, 'frozen', False):
+    # Running as compiled executable
+    _base_dir = os.path.dirname(sys.executable)
+else:
+    # Running as script
+    _base_dir = os.path.dirname(os.path.abspath(__file__))
+
+static_folder = os.path.join(_base_dir, 'static')
 app = Flask(__name__, static_folder=None)
 
 # Configure Flask to close connections properly
