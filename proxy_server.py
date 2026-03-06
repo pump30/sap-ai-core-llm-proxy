@@ -354,6 +354,139 @@ def get_sapaicore_sdk_client(model_name: str):
             _bedrock_clients[model_name] = client
     return client
 
+# ------------------------
+# Image Generation Endpoint
+# ------------------------
+@app.route('/v1/images/generations', methods=['POST'])
+def handle_image_generation_request():
+    """Handle image generation requests (DALL-E 3 compatible endpoint)."""
+    logging.info("Received request to /v1/images/generations")
+    
+    if not verify_request_token(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    payload = request.json
+    prompt = payload.get("prompt")
+    model = payload.get("model", "dall-e-3")
+    n = payload.get("n", 1)  # Number of images to generate
+    size = payload.get("size", "1024x1024")  # Image size
+    quality = payload.get("quality", "standard")  # standard or hd
+    style = payload.get("style", "vivid")  # vivid or natural
+    response_format = payload.get("response_format", "url")  # url or b64_json
+    
+    if not prompt:
+        return jsonify({"error": {"message": "Prompt is required", "type": "invalid_request_error"}}), 400
+    
+    try:
+        # Get the deployment URL for the image model
+        selected_url, subaccount_name, resource_group, model = load_balance_url(model)
+        subaccount_token = fetch_token(subaccount_name)
+        subaccount = proxy_config.subaccounts[subaccount_name]
+        service_key = subaccount.service_key
+        
+        # Construct the endpoint URL for DALL-E 3
+        # SAP AI Core uses Azure OpenAI format
+        api_version = "2024-02-01"
+        endpoint_url = f"{selected_url.rstrip('/')}/images/generations?api-version={api_version}"
+        
+        # Prepare the request payload for Azure OpenAI DALL-E 3
+        modified_payload = {
+            "prompt": prompt,
+            "n": n,
+            "size": size,
+            "quality": quality,
+            "style": style,
+            "response_format": response_format
+        }
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {subaccount_token}",
+            "AI-Resource-Group": resource_group,
+            "AI-Tenant-Id": service_key.identityzoneid
+        }
+        
+        logging.info(f"Forwarding image generation request to {endpoint_url} with subAccount '{subaccount_name}'")
+        logging.info(f"Image generation payload: {json.dumps(modified_payload, indent=2)}")
+        
+        response = _http_session.post(endpoint_url, headers=headers, json=modified_payload, timeout=120)
+        response.raise_for_status()
+        
+        result = response.json()
+        response.close()
+        
+        # Format response to match OpenAI format
+        formatted_response = format_image_generation_response(result, model)
+        
+        logging.info(f"Image generation successful for model '{model}' using subAccount '{subaccount_name}'")
+        return jsonify(formatted_response), 200
+        
+    except ValueError as e:
+        logging.error(f"Value error in image generation: {e}")
+        return jsonify({"error": {"message": str(e), "type": "invalid_request_error"}}), 400
+    except requests.exceptions.HTTPError as err:
+        logging.error(f"HTTP error in image generation: {err}")
+        if err.response:
+            logging.error(f"Error response status: {err.response.status_code}")
+            logging.error(f"Error response body: {err.response.text}")
+            try:
+                error_data = err.response.json()
+                return jsonify(error_data), err.response.status_code
+            except json.JSONDecodeError:
+                return jsonify({"error": {"message": err.response.text, "type": "api_error"}}), err.response.status_code
+        return jsonify({"error": {"message": str(err), "type": "api_error"}}), 500
+    except Exception as e:
+        logging.error(f"Error handling image generation request: {e}", exc_info=True)
+        return jsonify({"error": {"message": str(e), "type": "api_error"}}), 500
+
+
+def format_image_generation_response(response, model):
+    """Format the image generation response to match OpenAI format.
+    
+    Args:
+        response: Raw response from SAP AI Core / Azure OpenAI
+        model: Model name used
+        
+    Returns:
+        Formatted response in OpenAI format
+    """
+    # The response from Azure OpenAI DALL-E 3 should already be in OpenAI format
+    # but we ensure consistency here
+    
+    data = response.get("data", [])
+    formatted_data = []
+    
+    for i, item in enumerate(data):
+        formatted_item = {
+            "revised_prompt": item.get("revised_prompt", ""),
+        }
+        
+        # Include either URL or base64 data based on response format
+        if "url" in item:
+            formatted_item["url"] = item["url"]
+        if "b64_json" in item:
+            formatted_item["b64_json"] = item["b64_json"]
+            
+        formatted_data.append(formatted_item)
+    
+    return {
+        "created": response.get("created", int(time.time())),
+        "data": formatted_data
+    }
+
+
+def is_image_model(model):
+    """Check if the model is an image generation model.
+    
+    Args:
+        model: The model name to check
+        
+    Returns:
+        bool: True if the model is an image generation model, False otherwise
+    """
+    return any(keyword in model.lower() for keyword in ["dall-e", "dalle", "image"])
+
+
 @app.route('/v1/embeddings', methods=['POST'])
 def handle_embedding_request():
     logging.info("Received request to /v1/embeddings")
@@ -3485,6 +3618,7 @@ if __name__ == '__main__':
     logging.info(f"  - Anthropic Claude API: http://{host}:{port}/v1/messages")
     logging.info(f"  - Models Listing: http://{host}:{port}/v1/models")
     logging.info(f"  - Embeddings API: http://{host}:{port}/v1/embeddings")
+    logging.info(f"  - Image Generation API: http://{host}:{port}/v1/images/generations")
 
     # Start connection pool maintenance thread
     maintenance_thread = threading.Thread(target=maintain_connection_pool, daemon=True)

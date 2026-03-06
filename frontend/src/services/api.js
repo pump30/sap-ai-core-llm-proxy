@@ -113,6 +113,32 @@ export class ChatAPI {
     }
     return res.json();
   }
+
+  async generateImage(prompt, options = {}) {
+    const res = await fetch('/v1/images/generations', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(this.apiKey ? { 'Authorization': `Bearer ${this.apiKey}` } : {})
+      },
+      body: JSON.stringify({
+        model: options.model || 'dall-e-3',
+        prompt,
+        size: options.size || '1024x1024',
+        quality: options.quality || 'standard',
+        style: options.style || 'vivid',
+        n: options.n || 1,
+        response_format: options.response_format || 'url'
+      })
+    });
+
+    if (!res.ok) {
+      const errorText = await res.text();
+      throw new Error(`Image Generation Error: ${res.status} - ${errorText}`);
+    }
+
+    return res.json();
+  }
 }
 
 export const api = new ChatAPI();

@@ -4,6 +4,7 @@ import { MessageInput } from './components/MessageInput';
 import { ModelSelector } from './components/ModelSelector';
 import { Settings, loadSettings, saveSettings } from './components/Settings';
 import { Overview } from './components/Overview';
+import { ImageGenerator } from './components/ImageGenerator';
 import { useChat } from './hooks/useChat';
 import { api } from './services/api';
 
@@ -54,6 +55,12 @@ function App() {
             >
               Overview
             </button>
+            <button
+              className={`tab-btn ${activeTab === 'images' ? 'active' : ''}`}
+              onClick={() => setActiveTab('images')}
+            >
+              Images
+            </button>
           </div>
         </div>
         <div className="header-controls">
@@ -87,14 +94,16 @@ function App() {
         </div>
       )}
 
-      {activeTab === 'chat' ? (
+      {activeTab === 'chat' && (
         <>
           <ChatContainer messages={messages} isLoading={isLoading} />
           <MessageInput onSend={handleSend} disabled={isLoading} />
         </>
-      ) : (
-        <Overview />
       )}
+      
+      {activeTab === 'overview' && <Overview />}
+      
+      {activeTab === 'images' && <ImageGenerator />}
 
       <Settings
         isOpen={settingsOpen}
