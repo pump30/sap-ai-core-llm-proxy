@@ -114,6 +114,16 @@ export class ChatAPI {
     return res.json();
   }
 
+  async getTokenUsage() {
+    const res = await fetch('/api/token-usage', {
+      headers: this.apiKey ? { 'Authorization': `Bearer ${this.apiKey}` } : {}
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to fetch token usage: ${res.status}`);
+    }
+    return res.json();
+  }
+
   async generateImage(prompt, options = {}) {
     const res = await fetch('/v1/images/generations', {
       method: 'POST',

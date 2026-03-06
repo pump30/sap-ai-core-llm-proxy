@@ -2236,6 +2236,228 @@ def health_check():
         "server": "sap-ai-core-llm-proxy"
     }), 200
 
+# Model pricing per 1M tokens (USD)
+# Based on publicly available API pricing as of 2026
+MODEL_PRICING = {
+    # Claude models (Anthropic pricing)
+    'anthropic--claude-4.6-opus': {'prompt': 15.0, 'completion': 75.0},
+    'anthropic--claude-4.6-sonnet': {'prompt': 3.0, 'completion': 15.0},
+    'anthropic--claude-4.5-opus': {'prompt': 15.0, 'completion': 75.0},
+    'anthropic--claude-4.5-sonnet': {'prompt': 3.0, 'completion': 15.0},
+    'anthropic--claude-4.5-haiku': {'prompt': 0.80, 'completion': 4.0},
+    'anthropic--claude-4-sonnet': {'prompt': 3.0, 'completion': 15.0},
+    'anthropic--claude-3.7-sonnet': {'prompt': 3.0, 'completion': 15.0},
+    'anthropic--claude-3.5-sonnet': {'prompt': 3.0, 'completion': 15.0},
+    'anthropic--claude-3-sonnet': {'prompt': 3.0, 'completion': 15.0},
+    'anthropic--claude-3-haiku': {'prompt': 0.25, 'completion': 1.25},
+    'anthropic--claude-3-opus': {'prompt': 15.0, 'completion': 75.0},
+    
+    # GPT models (OpenAI pricing)
+    'gpt-5': {'prompt': 10.0, 'completion': 30.0},
+    'gpt-5-mini': {'prompt': 3.0, 'completion': 12.0},
+    'gpt-4o': {'prompt': 2.50, 'completion': 10.0},
+    'gpt-4o-mini': {'prompt': 0.15, 'completion': 0.60},
+    'gpt-4': {'prompt': 30.0, 'completion': 60.0},
+    'gpt-4-32k': {'prompt': 60.0, 'completion': 120.0},
+    'gpt-35-turbo': {'prompt': 0.50, 'completion': 1.50},
+    'gpt-35-turbo-16k': {'prompt': 3.0, 'completion': 4.0},
+    'gpt-35-turbo-0125': {'prompt': 0.50, 'completion': 1.50},
+    
+    # Gemini models (Google pricing)
+    'gemini-2.5-pro': {'prompt': 1.25, 'completion': 5.0},
+    'gemini-2.0-flash': {'prompt': 0.075, 'completion': 0.30},
+    'gemini-1.5-pro': {'prompt': 1.25, 'completion': 5.0},
+    'gemini-1.5-flash': {'prompt': 0.075, 'completion': 0.30},
+    'gemini-1.0-pro': {'prompt': 0.50, 'completion': 1.50},
+    
+    # Embedding models
+    'text-embedding-3-large': {'prompt': 0.13, 'completion': 0.0},
+    'text-embedding-ada-002': {'prompt': 0.10, 'completion': 0.0},
+    
+    # Image generation (per image, not per token)
+    'dall-e-3': {'prompt': 0.04, 'completion': 0.0},  # $0.04 per image (1024x1024)
+}
+
+def get_model_pricing(model_name):
+    """Get pricing for a model, with fuzzy matching for similar model names."""
+    # Direct match
+    if model_name in MODEL_PRICING:
+        return MODEL_PRICING[model_name]
+    
+    # Fuzzy match for model variants
+    model_lower = model_name.lower()
+    for key, pricing in MODEL_PRICING.items():
+        if key.lower() in model_lower or model_lower in key.lower():
+            return pricing
+    
+    # Default pricing for unknown models (conservative estimate)
+    return {'prompt': 1.0, 'completion': 3.0}
+
+def calculate_cost(model, prompt_tokens, completion_tokens):
+    """Calculate cost in USD for given token usage."""
+    pricing = get_model_pricing(model)
+    # Pricing is per 1M tokens
+    prompt_cost = (prompt_tokens / 1_000_000) * pricing['prompt']
+    completion_cost = (completion_tokens / 1_000_000) * pricing['completion']
+    return prompt_cost + completion_cost
+
+
+@app.route('/api/token-usage', methods=['GET'])
+def get_token_usage():
+    """Returns token usage statistics from logs."""
+    logging.info(">>> /api/token-usage route handler called")
+    
+    log_file = os.path.join(log_directory, 'token_usage.log')
+    
+    # Initialize statistics
+    stats = {
+        'total_requests': 0,
+        'total_prompt_tokens': 0,
+        'total_completion_tokens': 0,
+        'total_tokens': 0,
+        'total_cost': 0.0,
+        'by_model': {},
+        'by_subaccount': {},
+        'by_date': {},
+        'recent_requests': []
+    }
+    
+    if not os.path.exists(log_file):
+        return jsonify(stats)
+    
+    try:
+        with open(log_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        # Parse each log line
+        for line in lines:
+            try:
+                # Format: 2026-02-04 01:42:33,929 - User: Bearer sap-ai-key, IP: 127.0.0.1, Model: xxx, SubAccount: xxx, PromptTokens: 0, CompletionTokens: 0, TotalTokens: 0, Duration: 4746ms, (Streaming)
+                parts = line.strip().split(' - ', 1)
+                if len(parts) < 2:
+                    continue
+                
+                timestamp_str = parts[0]
+                data_str = parts[1]
+                
+                # Parse date for grouping
+                date_str = timestamp_str.split(' ')[0]
+                
+                # Parse key-value pairs
+                data = {}
+                for item in data_str.split(', '):
+                    if ':' in item:
+                        key, value = item.split(': ', 1)
+                        data[key.strip()] = value.strip()
+                
+                model = data.get('Model', 'unknown')
+                subaccount = data.get('SubAccount', 'unknown')
+                prompt_tokens = int(data.get('PromptTokens', 0))
+                completion_tokens = int(data.get('CompletionTokens', 0))
+                total_tokens = int(data.get('TotalTokens', 0))
+                duration = data.get('Duration', '0ms').replace('ms', '')
+                is_streaming = '(Streaming)' in line
+                
+                # Update totals
+                stats['total_requests'] += 1
+                stats['total_prompt_tokens'] += prompt_tokens
+                stats['total_completion_tokens'] += completion_tokens
+                stats['total_tokens'] += total_tokens
+                
+                # Calculate cost for this request
+                request_cost = calculate_cost(model, prompt_tokens, completion_tokens)
+                stats['total_cost'] += request_cost
+                
+                # Update by model
+                if model not in stats['by_model']:
+                    stats['by_model'][model] = {
+                        'requests': 0,
+                        'prompt_tokens': 0,
+                        'completion_tokens': 0,
+                        'total_tokens': 0,
+                        'cost': 0.0
+                    }
+                stats['by_model'][model]['requests'] += 1
+                stats['by_model'][model]['prompt_tokens'] += prompt_tokens
+                stats['by_model'][model]['completion_tokens'] += completion_tokens
+                stats['by_model'][model]['total_tokens'] += total_tokens
+                stats['by_model'][model]['cost'] += request_cost
+                
+                # Update by subaccount
+                if subaccount not in stats['by_subaccount']:
+                    stats['by_subaccount'][subaccount] = {
+                        'requests': 0,
+                        'prompt_tokens': 0,
+                        'completion_tokens': 0,
+                        'total_tokens': 0,
+                        'cost': 0.0
+                    }
+                stats['by_subaccount'][subaccount]['requests'] += 1
+                stats['by_subaccount'][subaccount]['prompt_tokens'] += prompt_tokens
+                stats['by_subaccount'][subaccount]['completion_tokens'] += completion_tokens
+                stats['by_subaccount'][subaccount]['total_tokens'] += total_tokens
+                stats['by_subaccount'][subaccount]['cost'] += request_cost
+                
+                # Update by date
+                if date_str not in stats['by_date']:
+                    stats['by_date'][date_str] = {
+                        'requests': 0,
+                        'prompt_tokens': 0,
+                        'completion_tokens': 0,
+                        'total_tokens': 0,
+                        'cost': 0.0
+                    }
+                stats['by_date'][date_str]['requests'] += 1
+                stats['by_date'][date_str]['prompt_tokens'] += prompt_tokens
+                stats['by_date'][date_str]['completion_tokens'] += completion_tokens
+                stats['by_date'][date_str]['total_tokens'] += total_tokens
+                stats['by_date'][date_str]['cost'] += request_cost
+                
+            except Exception as e:
+                logging.warning(f"Failed to parse log line: {e}")
+                continue
+        
+        # Get recent requests (last 20)
+        recent_lines = lines[-20:] if len(lines) > 20 else lines
+        for line in reversed(recent_lines):
+            try:
+                parts = line.strip().split(' - ', 1)
+                if len(parts) < 2:
+                    continue
+                timestamp_str = parts[0]
+                data_str = parts[1]
+                
+                data = {}
+                for item in data_str.split(', '):
+                    if ':' in item:
+                        key, value = item.split(': ', 1)
+                        data[key.strip()] = value.strip()
+                
+                req_model = data.get('Model', 'unknown')
+                req_prompt = int(data.get('PromptTokens', 0))
+                req_completion = int(data.get('CompletionTokens', 0))
+                req_cost = calculate_cost(req_model, req_prompt, req_completion)
+                
+                stats['recent_requests'].append({
+                    'timestamp': timestamp_str,
+                    'model': req_model,
+                    'subaccount': data.get('SubAccount', 'unknown'),
+                    'prompt_tokens': req_prompt,
+                    'completion_tokens': req_completion,
+                    'total_tokens': int(data.get('TotalTokens', 0)),
+                    'duration': data.get('Duration', '0ms'),
+                    'streaming': '(Streaming)' in line,
+                    'cost': req_cost
+                })
+            except:
+                continue
+        
+    except Exception as e:
+        logging.error(f"Error reading token usage log: {e}")
+    
+    return jsonify(stats)
+
+
 @app.route('/api/overview', methods=['GET'])
 def get_overview():
     """Returns proxy overview information including server status, subaccounts, and models."""
@@ -2256,10 +2478,17 @@ def get_overview():
     # Collect models information
     models_info = []
     for model_name, subaccount_names in proxy_config.model_to_subaccounts.items():
+        # Count actual deployments across all subaccounts
+        total_deployments = 0
+        for sa_name in subaccount_names:
+            sa = proxy_config.subaccounts.get(sa_name)
+            if sa and model_name in sa.normalized_models:
+                total_deployments += len(sa.normalized_models[model_name])
+        
         models_info.append({
             "id": model_name,
             "subaccounts": subaccount_names,
-            "deployment_count": len(subaccount_names)
+            "deployment_count": total_deployments
         })
 
     return jsonify({
