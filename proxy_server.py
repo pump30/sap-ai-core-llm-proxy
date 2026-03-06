@@ -61,6 +61,11 @@ class SubAccountConfig:
     service_key: Optional[ServiceKey] = None
     token_info: TokenInfo = field(default_factory=TokenInfo)
     normalized_models: Dict[str, List[str]] = field(default_factory=dict)
+    # Auto-discovery fields
+    auto_discover_deployments: bool = False
+    include_patterns: List[str] = field(default_factory=list)
+    exclude_patterns: List[str] = field(default_factory=list)
+    discovered_deployments: Dict[str, List[str]] = field(default_factory=dict)
     
     def load_service_key(self):
         """Load service key from file"""
@@ -73,8 +78,148 @@ class SubAccountConfig:
         )
         
     def normalize_model_names(self):
-        """Keep model names as-is without removing any prefixes"""
-        self.normalized_models = self.deployment_models.copy()
+        """Merge discovered deployments with manual configuration.
+        
+        Manual configuration takes precedence - if a model is configured both
+        manually and discovered, the manual URLs are appended to discovered ones.
+        """
+        # Start with discovered deployments
+        self.normalized_models = self.discovered_deployments.copy()
+        
+        # Merge manual configuration (manual URLs are added to discovered ones)
+        for model, urls in self.deployment_models.items():
+            if model in self.normalized_models:
+                # Append manual URLs to discovered ones (avoid duplicates)
+                for url in urls:
+                    if url not in self.normalized_models[model]:
+                        self.normalized_models[model].append(url)
+            else:
+                self.normalized_models[model] = urls.copy()
+
+def should_include_model(model_name: str, include_patterns: List[str], exclude_patterns: List[str]) -> bool:
+    """Check if a model should be included based on include/exclude patterns.
+    
+    Args:
+        model_name: The model name to check
+        include_patterns: List of glob patterns to include (empty means include all)
+        exclude_patterns: List of glob patterns to exclude
+        
+    Returns:
+        True if the model should be included, False otherwise
+    """
+    import fnmatch
+    
+    # If include_patterns is specified, model must match at least one
+    if include_patterns:
+        included = any(fnmatch.fnmatch(model_name, pattern) for pattern in include_patterns)
+        if not included:
+            return False
+    
+    # If exclude_patterns is specified, model must not match any
+    if exclude_patterns:
+        excluded = any(fnmatch.fnmatch(model_name, pattern) for pattern in exclude_patterns)
+        if excluded:
+            return False
+    
+    return True
+
+
+def discover_deployments_for_subaccount(subaccount: SubAccountConfig) -> Dict[str, List[str]]:
+    """Discover all RUNNING deployments from SAP AI Core for a subaccount.
+    
+    This function queries the SAP AI Core REST API to get all deployments,
+    filters for RUNNING status, and extracts the model name from
+    details.resources.backend_details.model.name field.
+    
+    Args:
+        subaccount: The SubAccountConfig to discover deployments for
+        
+    Returns:
+        Dict mapping model names to lists of deployment URLs
+        
+    Raises:
+        Exception: If there's an error fetching or parsing deployments
+    """
+    # Load service key data
+    key_data_path = subaccount.service_key_json
+    with open(key_data_path, 'r') as f:
+        key_data = json.load(f)
+    
+    # 1. Get OAuth token
+    token_url = key_data['url'] + '/oauth/token'
+    auth_string = f"{key_data['clientid']}:{key_data['clientsecret']}"
+    encoded_auth = base64.b64encode(auth_string.encode()).decode()
+    
+    token_response = requests.post(
+        token_url,
+        data={'grant_type': 'client_credentials'},
+        headers={'Authorization': f'Basic {encoded_auth}'},
+        timeout=30
+    )
+    token_response.raise_for_status()
+    access_token = token_response.json()['access_token']
+    
+    # 2. Get base URL for AI API
+    base_url = key_data.get('serviceurls', {}).get('AI_API_URL') or key_data.get('base_url')
+    if not base_url:
+        raise ValueError("Cannot find AI_API_URL or base_url in service key")
+    
+    # 3. Query deployments
+    deployments_url = f'{base_url}/v2/lm/deployments'
+    deployments_response = requests.get(
+        deployments_url,
+        headers={
+            'Authorization': f'Bearer {access_token}',
+            'AI-Resource-Group': subaccount.resource_group
+        },
+        timeout=60
+    )
+    deployments_response.raise_for_status()
+    deployments_data = deployments_response.json()
+    
+    # 4. Build model_name -> [URLs] mapping
+    discovered = {}
+    running_count = 0
+    skipped_count = 0
+    
+    for deployment in deployments_data.get('resources', []):
+        # Only include RUNNING deployments
+        status = deployment.get('status')
+        if status != 'RUNNING':
+            skipped_count += 1
+            continue
+        
+        running_count += 1
+        
+        # Extract model name from details.resources.backend_details.model.name
+        details = deployment.get('details', {})
+        resources = details.get('resources', {})
+        backend_details = resources.get('backend_details', {})
+        model_info = backend_details.get('model', {})
+        model_name = model_info.get('name')
+        
+        # Get deployment URL
+        deployment_url = deployment.get('deploymentUrl')
+        
+        if not model_name or not deployment_url:
+            logging.debug(f"Skipping deployment {deployment.get('id', 'unknown')}: missing model_name or deploymentUrl")
+            continue
+        
+        # Apply include/exclude filters
+        if not should_include_model(model_name, subaccount.include_patterns, subaccount.exclude_patterns):
+            logging.debug(f"Skipping model '{model_name}' due to include/exclude patterns")
+            continue
+        
+        # Add to discovered mapping
+        if model_name not in discovered:
+            discovered[model_name] = []
+        discovered[model_name].append(deployment_url)
+    
+    logging.info(f"Discovery for '{subaccount.name}': found {running_count} RUNNING deployments, "
+                 f"skipped {skipped_count} non-RUNNING, discovered {len(discovered)} unique models")
+    
+    return discovered
+
 
 @dataclass
 class ProxyConfig:
@@ -89,6 +234,23 @@ class ProxyConfig:
         """Initialize all subaccounts and build model mappings"""
         for subaccount in self.subaccounts.values():
             subaccount.load_service_key()
+            
+            # Auto-discover deployments if enabled
+            if subaccount.auto_discover_deployments:
+                try:
+                    logging.info(f"Auto-discovering deployments for subAccount '{subaccount.name}'...")
+                    discovered = discover_deployments_for_subaccount(subaccount)
+                    subaccount.discovered_deployments = discovered
+                    
+                    # Log discovered models
+                    logging.info(f"Auto-discovered {len(discovered)} models for '{subaccount.name}':")
+                    for model_name, urls in sorted(discovered.items()):
+                        logging.info(f"  - {model_name}: {len(urls)} deployment(s)")
+                except Exception as e:
+                    logging.error(f"Failed to discover deployments for '{subaccount.name}': {e}", exc_info=True)
+                    # Continue with manual configuration only
+                    subaccount.discovered_deployments = {}
+            
             subaccount.normalize_model_names()
             
         # Build model to subaccounts mapping for load balancing
@@ -348,7 +510,13 @@ token_expiry = 0
 lock = threading.Lock()
 
 def load_config(file_path):
-    """Loads configuration from a JSON file with support for multiple subAccounts."""
+    """Loads configuration from a JSON file with support for multiple subAccounts.
+    
+    Supports auto-discovery configuration:
+    - auto_discover_deployments: bool - Enable automatic deployment discovery
+    - include_patterns: List[str] - Glob patterns to include models (empty = all)
+    - exclude_patterns: List[str] - Glob patterns to exclude models
+    """
     with open(file_path, 'r') as file:
         config_json = json.load(file)
     
@@ -367,7 +535,11 @@ def load_config(file_path):
                 name=sub_name,
                 resource_group=sub_config.get('resource_group', 'default'),
                 service_key_json=sub_config.get('service_key_json', ''),
-                deployment_models=sub_config.get('deployment_models', {})
+                deployment_models=sub_config.get('deployment_models', {}),
+                # Auto-discovery configuration
+                auto_discover_deployments=sub_config.get('auto_discover_deployments', False),
+                include_patterns=sub_config.get('include_patterns', []),
+                exclude_patterns=sub_config.get('exclude_patterns', [])
             )
         
         return proxy_conf
