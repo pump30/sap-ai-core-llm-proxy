@@ -1,5 +1,5 @@
 import logging
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, stream_with_context, send_from_directory
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -137,7 +137,10 @@ def create_http_session():
 # Create global session (reuse across requests)
 _http_session = create_http_session()
 
-app = Flask(__name__)
+# Setup static folder for frontend (manually served, not via Flask's static_url_path)
+# This prevents conflicts between static files and API routes
+static_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
+app = Flask(__name__, static_folder=None)
 
 # Configure Flask to close connections properly
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
@@ -1916,6 +1919,9 @@ def proxy_openai_stream2():
         }
     }), 204
 
+# ------------------------
+# Health & API Routes
+# ------------------------
 @app.route('/health', methods=['GET'])
 def health_check():
     """Lightweight health check endpoint that doesn't require token verification."""
@@ -1924,6 +1930,78 @@ def health_check():
         "timestamp": int(time.time()),
         "server": "sap-ai-core-llm-proxy"
     }), 200
+
+@app.route('/api/overview', methods=['GET'])
+def get_overview():
+    """Returns proxy overview information including server status, subaccounts, and models."""
+    print(">>> /api/overview route handler called", flush=True)
+    logging.info(">>> /api/overview route handler called")
+    # Collect subaccounts information
+    subaccounts_info = []
+    for name, subaccount in proxy_config.subaccounts.items():
+        subaccounts_info.append({
+            "name": name,
+            "resource_group": subaccount.resource_group,
+            "models": list(subaccount.normalized_models.keys()),
+            "models_count": len(subaccount.normalized_models),
+            "token_valid": subaccount.token_info.token is not None,
+            "token_expires_at": subaccount.token_info.expiry
+        })
+
+    # Collect models information
+    models_info = []
+    for model_name, subaccount_names in proxy_config.model_to_subaccounts.items():
+        models_info.append({
+            "id": model_name,
+            "subaccounts": subaccount_names,
+            "deployment_count": len(subaccount_names)
+        })
+
+    return jsonify({
+        "server": {
+            "host": proxy_config.host,
+            "port": proxy_config.port,
+            "status": "running"
+        },
+        "subaccounts": subaccounts_info,
+        "models": models_info,
+        "statistics": {
+            "total_models": len(proxy_config.model_to_subaccounts),
+            "total_subaccounts": len(proxy_config.subaccounts),
+            "authentication_enabled": len(proxy_config.secret_authentication_tokens) > 0
+        }
+    })
+
+# ------------------------
+# Frontend Routes
+# ------------------------
+@app.route('/')
+def serve_frontend():
+    """Serve the React frontend application."""
+    return send_from_directory(static_folder, 'index.html')
+
+@app.route('/assets/<path:path>')
+def serve_assets(path):
+    """Serve static assets (JS, CSS, images) from the assets folder."""
+    return send_from_directory(os.path.join(static_folder, 'assets'), path)
+
+@app.route('/vite.svg')
+def serve_vite_svg():
+    """Serve the Vite favicon."""
+    return send_from_directory(static_folder, 'vite.svg')
+
+@app.errorhandler(404)
+def not_found(e):
+    """SPA fallback - serve index.html for unknown routes to support React Router."""
+    print(f">>> 404 handler triggered for path: {request.path}", flush=True)
+    logging.info(f">>> 404 handler triggered for path: {request.path}")
+    # Only serve index.html for non-API routes
+    if not request.path.startswith('/v1/') and not request.path.startswith('/health') and not request.path.startswith('/api'):
+        try:
+            return send_from_directory(static_folder, 'index.html')
+        except Exception:
+            pass
+    return jsonify({"error": "Not found"}), 404
 
 @app.route('/v1/models', methods=['GET', 'OPTIONS'])
 def list_models():
@@ -3221,6 +3299,11 @@ if __name__ == '__main__':
         
         # Build model mappings
         proxy_config.build_model_mapping()
+
+    # Print all registered routes for debugging
+    logging.info("Registered routes:")
+    for rule in app.url_map.iter_rules():
+        logging.info(f"  {rule.endpoint}: {rule.rule} [{', '.join(rule.methods)}]")
 
     logging.info(f"Starting proxy server on host {host} and port {port}...")
     logging.info(f"API Host: http://{host}:{port}/v1")
